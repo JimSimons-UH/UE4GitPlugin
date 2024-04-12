@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020 Sebastien Rombauts (sebastien.rombauts@gmail.com)
+// Copyright (c) 2014-2022 Sebastien Rombauts (sebastien.rombauts@gmail.com)
 //
 // Distributed under the MIT License (MIT) (See accompanying file LICENSE.txt
 // or copy at http://opensource.org/licenses/MIT)
@@ -9,12 +9,24 @@
 #include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
 #include "GitSourceControlModule.h"
+#include "GitSourceControlProvider.h"
 #include "GitSourceControlUtils.h"
 
 #define LOCTEXT_NAMESPACE "GitSourceControl"
 
-bool FGitSourceControlRevision::Get( FString& InOutFilename ) const
+#if ENGINE_MAJOR_VERSION == 5
+bool FGitSourceControlRevision::Get(FString& InOutFilename, EConcurrency::Type InConcurrency /* = EConcurrency::Synchronous */) const
+#else
+bool FGitSourceControlRevision::Get(FString& InOutFilename) const
+#endif
 {
+#if ENGINE_MAJOR_VERSION == 5
+	if (InConcurrency != EConcurrency::Synchronous)
+	{
+		UE_LOG(LogSourceControl, Warning, TEXT("Only EConcurrency::Synchronous is tested/supported for this operation."));
+	}
+#endif
+
 	FGitSourceControlModule& GitSourceControl = FModuleManager::GetModuleChecked<FGitSourceControlModule>("GitSourceControl");
 	const FString PathToGitBinary = GitSourceControl.AccessSettings().GetBinaryPath();
 	const FString PathToRepositoryRoot = GitSourceControl.GetProvider().GetPathToRepositoryRoot();

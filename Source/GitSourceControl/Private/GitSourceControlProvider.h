@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020 Sebastien Rombauts (sebastien.rombauts@gmail.com)
+// Copyright (c) 2014-2022 Sebastien Rombauts (sebastien.rombauts@gmail.com)
 //
 // Distributed under the MIT License (MIT) (See accompanying file LICENSE.txt
 // or copy at http://opensource.org/licenses/MIT)
@@ -12,6 +12,9 @@
 #include "IGitSourceControlWorker.h"
 #include "GitSourceControlState.h"
 #include "GitSourceControlMenu.h"
+#include "GitSourceControlConsole.h"
+
+#include "Runtime/Launch/Resources/Version.h"
 
 class FGitSourceControlCommand;
 
@@ -51,9 +54,7 @@ class FGitSourceControlProvider : public ISourceControlProvider
 {
 public:
 	/** Constructor */
-	FGitSourceControlProvider() 
-		: bGitAvailable(false)
-		, bGitRepositoryFound(false)
+	FGitSourceControlProvider()
 	{
 	}
 
@@ -61,27 +62,49 @@ public:
 	virtual void Init(bool bForceConnection = true) override;
 	virtual void Close() override;
 	virtual FText GetStatusText() const override;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
+	virtual TMap<EStatus, FString> GetStatus() const override;
+#endif
 	virtual bool IsEnabled() const override;
 	virtual bool IsAvailable() const override;
 	virtual const FName& GetName(void) const override;
-	virtual bool QueryStateBranchConfig(const FString& ConfigSrc, const FString& ConfigDest) /* override UE4.20 */ { return false; }
-	virtual void RegisterStateBranches(const TArray<FString>& BranchNames, const FString& ContentRoot) /* override UE4.20 */ {}
-	virtual int32 GetStateBranchIndex(const FString& InBranchName) const /* override UE4.20 */ { return INDEX_NONE; }
-	virtual ECommandResult::Type GetState( const TArray<FString>& InFiles, TArray< TSharedRef<ISourceControlState, ESPMode::ThreadSafe> >& OutState, EStateCacheUsage::Type InStateCacheUsage ) override;
+	virtual bool QueryStateBranchConfig(const FString& ConfigSrc, const FString& ConfigDest) override { return false; }
+	virtual void RegisterStateBranches(const TArray<FString>& BranchNames, const FString& ContentRoot) override {}
+	virtual int32 GetStateBranchIndex(const FString& InBranchName) const override { return INDEX_NONE; }
+	virtual ECommandResult::Type GetState(const TArray<FString>& InFiles, TArray<FSourceControlStateRef>& OutState, EStateCacheUsage::Type InStateCacheUsage) override;
+#if ENGINE_MAJOR_VERSION == 5
+	virtual ECommandResult::Type GetState(const TArray<FSourceControlChangelistRef>& InChangelists, TArray<FSourceControlChangelistStateRef>& OutState, EStateCacheUsage::Type InStateCacheUsage) override;
+#endif
 	virtual TArray<FSourceControlStateRef> GetCachedStateByPredicate(TFunctionRef<bool(const FSourceControlStateRef&)> Predicate) const override;
 	virtual FDelegateHandle RegisterSourceControlStateChanged_Handle(const FSourceControlStateChanged::FDelegate& SourceControlStateChanged) override;
 	virtual void UnregisterSourceControlStateChanged_Handle(FDelegateHandle Handle) override;
-	virtual ECommandResult::Type Execute(const TSharedRef<ISourceControlOperation, ESPMode::ThreadSafe>& InOperation, const TArray<FString>& InFiles, EConcurrency::Type InConcurrency = EConcurrency::Synchronous, const FSourceControlOperationComplete& InOperationCompleteDelegate = FSourceControlOperationComplete()) override;
-	virtual bool CanCancelOperation( const TSharedRef<ISourceControlOperation, ESPMode::ThreadSafe>& InOperation ) const override;
-	virtual void CancelOperation( const TSharedRef<ISourceControlOperation, ESPMode::ThreadSafe>& InOperation ) override;
+#if ENGINE_MAJOR_VERSION == 5
+	virtual ECommandResult::Type Execute(const FSourceControlOperationRef& InOperation, FSourceControlChangelistPtr InChangelist, const TArray<FString>& InFiles, EConcurrency::Type InConcurrency = EConcurrency::Synchronous, const FSourceControlOperationComplete& InOperationCompleteDelegate = FSourceControlOperationComplete() ) override;
+#else
+	virtual ECommandResult::Type Execute(const FSourceControlOperationRef& InOperation, const TArray<FString>& InFiles, EConcurrency::Type InConcurrency = EConcurrency::Synchronous, const FSourceControlOperationComplete& InOperationCompleteDelegate = FSourceControlOperationComplete() ) override;
+#endif
+	virtual bool CanExecuteOperation( const FSourceControlOperationRef& InOperation ) const; /* override	NOTE: added in UE5.3 */
+	virtual bool CanCancelOperation(const FSourceControlOperationRef& InOperation) const override;
+	virtual void CancelOperation(const FSourceControlOperationRef& InOperation) override;
 	virtual bool UsesLocalReadOnlyState() const override;
 	virtual bool UsesChangelists() const override;
 	virtual bool UsesCheckout() const override;
+	virtual bool UsesFileRevisions() const; /* override				NOTE: added in UE5.1 */
+	virtual TOptional<bool> IsAtLatestRevision() const; /* override	NOTE: added in UE5.1 */
+	virtual TOptional<int> GetNumLocalChanges() const; /* override	NOTE: added in UE5.1 */
+	virtual bool UsesUncontrolledChangelists() const; /* override   NOTE: added in UE5.2 */
+	virtual bool UsesSnapshots() const; /* override   NOTE: added in UE5.2 */
+	virtual bool AllowsDiffAgainstDepot() const; /* override   NOTE: added in UE5.2 */
 	virtual void Tick() override;
-	virtual TArray< TSharedRef<class ISourceControlLabel> > GetLabels( const FString& InMatchingSpec ) const override;
+	virtual TArray< TSharedRef<class ISourceControlLabel> > GetLabels(const FString& InMatchingSpec) const override;
+#if ENGINE_MAJOR_VERSION == 5
+	virtual TArray<FSourceControlChangelistRef> GetChangelists(EStateCacheUsage::Type InStateCacheUsage) override;
+#endif
 #if SOURCE_CONTROL_WITH_SLATE
 	virtual TSharedRef<class SWidget> MakeSettingsWidget() const override;
 #endif
+
+	using ISourceControlProvider::Execute;
 
 	/**
 	 * Check configuration, else standard paths, and run a Git "version" command to check the availability of the binary.
@@ -147,10 +170,10 @@ public:
 private:
 
 	/** Is git binary found and working. */
-	bool bGitAvailable;
+	bool bGitAvailable = false;
 
 	/** Is git repository found. */
-	bool bGitRepositoryFound;
+	bool bGitRepositoryFound = false;
 
 	/** Is LFS File Locking enabled? */
 	bool bUsingGitLfsLocking = false;
@@ -207,4 +230,7 @@ private:
 
 	/** Source Control Menu Extension */
 	FGitSourceControlMenu GitSourceControlMenu;
+
+	/** Source Control Console commands */
+	FGitSourceControlConsole GitSourceControlConsole;
 };

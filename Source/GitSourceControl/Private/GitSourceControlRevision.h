@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020 Sebastien Rombauts (sebastien.rombauts@gmail.com)
+// Copyright (c) 2014-2022 Sebastien Rombauts (sebastien.rombauts@gmail.com)
 //
 // Distributed under the MIT License (MIT) (See accompanying file LICENSE.txt
 // or copy at http://opensource.org/licenses/MIT)
@@ -8,19 +8,21 @@
 #include "CoreMinimal.h"
 #include "ISourceControlRevision.h"
 
+#include "Runtime/Launch/Resources/Version.h"
+
 /** Revision of a file, linked to a specific commit */
-class FGitSourceControlRevision : public ISourceControlRevision, public TSharedFromThis<FGitSourceControlRevision, ESPMode::ThreadSafe>
+class FGitSourceControlRevision : public ISourceControlRevision
 {
 public:
-	FGitSourceControlRevision()
-		: RevisionNumber(0)
-	{
-	}
 
 	/** ISourceControlRevision interface */
-	virtual bool Get( FString& InOutFilename ) const override;
-	virtual bool GetAnnotated( TArray<FAnnotationLine>& OutLines ) const override;
-	virtual bool GetAnnotated( FString& InOutFilename ) const override;
+#if ENGINE_MAJOR_VERSION == 5
+	virtual bool Get(FString& InOutFilename, EConcurrency::Type InConcurrency = EConcurrency::Synchronous) const override;
+#else
+	virtual bool Get(FString& InOutFilename) const override;
+#endif
+	virtual bool GetAnnotated(TArray<FAnnotationLine>& OutLines) const override;
+	virtual bool GetAnnotated(FString& InOutFilename) const override;
 	virtual const FString& GetFilename() const override;
 	virtual int32 GetRevisionNumber() const override;
 	virtual const FString& GetRevision() const override;
@@ -45,10 +47,10 @@ public:
 	FString ShortCommitId;
 
 	/** The numeric value of the short SHA1 (8 first hex char out of 40) */
-	int32 CommitIdNumber;
+	int32 CommitIdNumber = 0;
 
 	/** The index of the revision in the history (SBlueprintRevisionMenu assumes order for the "Depot" label) */
-	int32 RevisionNumber;
+	int32 RevisionNumber = 0;
 
 	/** The SHA1 identifier of the file at this revision */
 	FString FileHash;

@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020 Sebastien Rombauts (sebastien.rombauts@gmail.com)
+// Copyright (c) 2014-2022 Sebastien Rombauts (sebastien.rombauts@gmail.com)
 //
 // Distributed under the MIT License (MIT) (See accompanying file LICENSE.txt
 // or copy at http://opensource.org/licenses/MIT)
@@ -19,20 +19,40 @@
 #include "Framework/Notifications/NotificationManager.h"
 #include "Framework/MultiBox/MultiBoxBuilder.h"
 #include "Misc/MessageDialog.h"
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+#include "Styling/AppStyle.h"
+#else
 #include "EditorStyleSet.h"
+#endif
 
 #include "PackageTools.h"
 #include "FileHelpers.h"
 
 #include "Logging/MessageLog.h"
+#include "UObject/Linker.h"
 
-static const FName GitSourceControlMenuTabName("GitSourceControlMenu");
+#if ENGINE_MAJOR_VERSION == 5
+#include "ToolMenus.h"
+#include "ToolMenuContext.h"
+#include "ToolMenuMisc.h"
+#endif
 
 #define LOCTEXT_NAMESPACE "GitSourceControl"
 
 void FGitSourceControlMenu::Register()
 {
 	// Register the extension with the level editor
+
+#if ENGINE_MAJOR_VERSION == 5
+	FToolMenuOwnerScoped SourceControlMenuOwner("GitSourceControlMenu");
+	if (UToolMenus* ToolMenus = UToolMenus::Get())
+	{
+		UToolMenu* SourceControlMenu = ToolMenus->ExtendMenu("StatusBar.ToolBar.SourceControl");
+		FToolMenuSection& Section = SourceControlMenu->AddSection("GitSourceControlActions", LOCTEXT("GitSourceControlMenuHeadingActions", "Git"), FToolMenuInsert(NAME_None, EToolMenuInsertType::First));
+
+		AddMenuExtension(Section);
+	}
+#else
 	FLevelEditorModule* LevelEditorModule = FModuleManager::GetModulePtr<FLevelEditorModule>("LevelEditor");
 	if (LevelEditorModule)
 	{
@@ -41,16 +61,24 @@ void FGitSourceControlMenu::Register()
 		MenuExtenders.Add(ViewMenuExtender);
 		ViewMenuExtenderHandle = MenuExtenders.Last().GetHandle();
 	}
+#endif
 }
 
 void FGitSourceControlMenu::Unregister()
 {
 	// Unregister the level editor extensions
+#if ENGINE_MAJOR_VERSION == 5
+	if (UToolMenus* ToolMenus = UToolMenus::Get())
+	{
+		UToolMenus::Get()->UnregisterOwnerByName("GitSourceControlMenu");
+	}
+#else
 	FLevelEditorModule* LevelEditorModule = FModuleManager::GetModulePtr<FLevelEditorModule>("LevelEditor");
 	if (LevelEditorModule)
 	{
 		LevelEditorModule->GetAllLevelEditorToolbarSourceControlMenuExtenders().RemoveAll([=](const FLevelEditorModule::FLevelEditorMenuExtender& Extender) { return Extender.GetHandle() == ViewMenuExtenderHandle; });
 	}
+#endif
 }
 
 bool FGitSourceControlMenu::HaveRemoteUrl() const
@@ -236,18 +264,71 @@ void FGitSourceControlMenu::SyncClicked()
 		const bool bSaved = SaveDirtyPackages();
 		if (bSaved)
 		{
-			// Find and Unlink all packages in Content directory to allow to update them
-			PackagesToReload = UnlinkPackages(ListAllPackages());
+			// Better way to do a pull/sync
+			// First fetch and check what files have really changed
+			// Then unload only the necessary packages instead of everything
+			// Then reload the changed package.
+			FGitSourceControlModule& GitSourceControl = FModuleManager::LoadModuleChecked<FGitSourceControlModule>("GitSourceControl");
+			FGitSourceControlProvider& Provider = GitSourceControl.GetProvider();
+			const FString& PathToRepositoryRoot = Provider.GetPathToRepositoryRoot();
+			const FString& PathToGitBinary = GitSourceControl.AccessSettings().GetBinaryPath();
 
-			// Ask the user if he wants to stash any modification and try to unstash them afterward, which could lead to conflicts
+			FString BranchName;
+			GitSourceControlUtils::GetBranchName(PathToGitBinary, PathToRepositoryRoot, BranchName);
+
+			FString DiffOrigin("..origin/");
+			DiffOrigin.Append(BranchName);
+
+			TArray<FString> ChangedFiles;
+			{
+				TArray<FString> ErrorMessages;
+				TArray<FString> Parameters;
+				Parameters.Add(TEXT("--stat"));
+				Parameters.Add(TEXT("--name-only"));
+				Parameters.Add(DiffOrigin);
+
+				// Get changed files remote and on local commits (we need to determine which ones are local commits)
+				GitSourceControlUtils::RunCommand(TEXT("diff"), PathToGitBinary, PathToRepositoryRoot, Parameters, TArray<FString>(), ChangedFiles, ErrorMessages);
+
+				// Handle uncommitted changes
+				TArray<FString> LocalChangedFiles;
+				const TArray<FString> ParametersStatus{"--porcelain --untracked-files=no"};
+				GitSourceControlUtils::RunCommand(TEXT("status"), PathToGitBinary, PathToRepositoryRoot, ParametersStatus, TArray<FString>(), LocalChangedFiles, ErrorMessages);
+
+				for(FString& Filename: LocalChangedFiles)
+				{
+					if(Filename.StartsWith(" M") || Filename.StartsWith(" A"))
+					{
+						ChangedFiles.Add(Filename.RightChop(3));
+					}
+				}
+			}
+
+			// TODO: Handle local commits
+			TArray<FString> PackagesToUnlink;
+			for(FString& Filename: ChangedFiles)
+			{
+				FString AbsolutePath = FPaths::ConvertRelativePathToFull(PathToRepositoryRoot, Filename);
+				FString PackageName;
+				if(FPackageName::TryConvertFilenameToLongPackageName(AbsolutePath, PackageName))
+				{
+					UE_LOG(LogTemp, Warning, TEXT("%s - %s"), *AbsolutePath, *PackageName);
+					PackagesToUnlink.Add(PackageName);
+				}
+			}
+		
+			PackagesToReload = UnlinkPackages(PackagesToUnlink);
+			
+			// // Ask the user if he wants to stash any modification and try to unstash them afterward, which could lead to conflicts
 			const bool bStashed = StashAwayAnyModifications();
 			if (bStashed)
 			{
-				// Launch a "Sync" operation
-				FGitSourceControlModule& GitSourceControl = FModuleManager::LoadModuleChecked<FGitSourceControlModule>("GitSourceControl");
-				FGitSourceControlProvider& Provider = GitSourceControl.GetProvider();
 				TSharedRef<FSync, ESPMode::ThreadSafe> SyncOperation = ISourceControlOperation::Create<FSync>();
+#if ENGINE_MAJOR_VERSION == 5
+				const ECommandResult::Type Result = Provider.Execute(SyncOperation, FSourceControlChangelistPtr(), TArray<FString>(), EConcurrency::Asynchronous, FSourceControlOperationComplete::CreateRaw(this, &FGitSourceControlMenu::OnSourceControlOperationComplete));
+#else
 				const ECommandResult::Type Result = Provider.Execute(SyncOperation, TArray<FString>(), EConcurrency::Asynchronous, FSourceControlOperationComplete::CreateRaw(this, &FGitSourceControlMenu::OnSourceControlOperationComplete));
+#endif
 				if (Result == ECommandResult::Succeeded)
 				{
 					// Display an ongoing notification during the whole operation (packages will be reloaded at the completion of the operation)
@@ -290,7 +371,11 @@ void FGitSourceControlMenu::PushClicked()
 		FGitSourceControlModule& GitSourceControl = FModuleManager::LoadModuleChecked<FGitSourceControlModule>("GitSourceControl");
 		FGitSourceControlProvider& Provider = GitSourceControl.GetProvider();
 		TSharedRef<FGitPush, ESPMode::ThreadSafe> PushOperation = ISourceControlOperation::Create<FGitPush>();
+#if ENGINE_MAJOR_VERSION == 5
+		const ECommandResult::Type Result = Provider.Execute(PushOperation, FSourceControlChangelistPtr(), TArray<FString>(), EConcurrency::Asynchronous, FSourceControlOperationComplete::CreateRaw(this, &FGitSourceControlMenu::OnSourceControlOperationComplete));
+#else
 		const ECommandResult::Type Result = Provider.Execute(PushOperation, TArray<FString>(), EConcurrency::Asynchronous, FSourceControlOperationComplete::CreateRaw(this, &FGitSourceControlMenu::OnSourceControlOperationComplete));
+#endif
 		if (Result == ECommandResult::Succeeded)
 		{
 			// Display an ongoing notification during the whole operation
@@ -328,7 +413,11 @@ void FGitSourceControlMenu::RevertClicked()
 			FGitSourceControlModule& GitSourceControl = FModuleManager::LoadModuleChecked<FGitSourceControlModule>("GitSourceControl");
 			FGitSourceControlProvider& Provider = GitSourceControl.GetProvider();
 			TSharedRef<FRevert, ESPMode::ThreadSafe> RevertOperation = ISourceControlOperation::Create<FRevert>();
+#if ENGINE_MAJOR_VERSION == 5
+			const ECommandResult::Type Result = Provider.Execute(RevertOperation, FSourceControlChangelistPtr(), TArray<FString>(), EConcurrency::Asynchronous, FSourceControlOperationComplete::CreateRaw(this, &FGitSourceControlMenu::OnSourceControlOperationComplete));
+#else
 			const ECommandResult::Type Result = Provider.Execute(RevertOperation, TArray<FString>(), EConcurrency::Asynchronous, FSourceControlOperationComplete::CreateRaw(this, &FGitSourceControlMenu::OnSourceControlOperationComplete));
+#endif
 			if (Result == ECommandResult::Succeeded)
 			{
 				// Display an ongoing notification during the whole operation
@@ -359,7 +448,11 @@ void FGitSourceControlMenu::RefreshClicked()
 		FGitSourceControlProvider& Provider = GitSourceControl.GetProvider();
 		TSharedRef<FUpdateStatus, ESPMode::ThreadSafe> RefreshOperation = ISourceControlOperation::Create<FUpdateStatus>();
 		RefreshOperation->SetCheckingAllFiles(true);
+#if ENGINE_MAJOR_VERSION == 5
+		const ECommandResult::Type Result = Provider.Execute(RefreshOperation, FSourceControlChangelistPtr(), TArray<FString>(), EConcurrency::Asynchronous, FSourceControlOperationComplete::CreateRaw(this, &FGitSourceControlMenu::OnSourceControlOperationComplete));
+#else
 		const ECommandResult::Type Result = Provider.Execute(RefreshOperation, TArray<FString>(), EConcurrency::Asynchronous, FSourceControlOperationComplete::CreateRaw(this, &FGitSourceControlMenu::OnSourceControlOperationComplete));
+#endif
 		if (Result == ECommandResult::Succeeded)
 		{
 			// Display an ongoing notification during the whole operation
@@ -415,7 +508,11 @@ void FGitSourceControlMenu::DisplaySucessNotification(const FName& InOperationNa
 	);
 	FNotificationInfo Info(NotificationText);
 	Info.bUseSuccessFailIcons = true;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+	Info.Image = FAppStyle::GetBrush(TEXT("NotificationList.SuccessImage"));
+#else
 	Info.Image = FEditorStyle::GetBrush(TEXT("NotificationList.SuccessImage"));
+#endif
 	FSlateNotificationManager::Get().AddNotification(Info);
 	UE_LOG(LogSourceControl, Log, TEXT("%s"), *NotificationText.ToString());
 }
@@ -456,12 +553,24 @@ void FGitSourceControlMenu::OnSourceControlOperationComplete(const FSourceContro
 	}
 }
 
+#if ENGINE_MAJOR_VERSION == 5
+void FGitSourceControlMenu::AddMenuExtension(FToolMenuSection& Builder)
+#else
 void FGitSourceControlMenu::AddMenuExtension(FMenuBuilder& Builder)
+#endif
 {
 	Builder.AddMenuEntry(
+#if ENGINE_MAJOR_VERSION == 5
+		"GitPush",
+#endif
+
 		LOCTEXT("GitPush",				"Push"),
 		LOCTEXT("GitPushTooltip",		"Push all local commits to the remote server."),
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+		FSlateIcon(FAppStyle::GetAppStyleSetName(), "SourceControl.Actions.Submit"),
+#else
 		FSlateIcon(FEditorStyle::GetStyleSetName(), "SourceControl.Actions.Submit"),
+#endif
 		FUIAction(
 			FExecuteAction::CreateRaw(this, &FGitSourceControlMenu::PushClicked),
 			FCanExecuteAction::CreateRaw(this, &FGitSourceControlMenu::HaveRemoteUrl)
@@ -469,9 +578,16 @@ void FGitSourceControlMenu::AddMenuExtension(FMenuBuilder& Builder)
 	);
 
 	Builder.AddMenuEntry(
+#if ENGINE_MAJOR_VERSION == 5
+		"GitSync",
+#endif
 		LOCTEXT("GitSync",				"Sync/Pull"),
 		LOCTEXT("GitSyncTooltip",		"Update all files in the local repository to the latest version of the remote server."),
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+		FSlateIcon(FAppStyle::GetAppStyleSetName(), "SourceControl.Actions.Sync"),
+#else
 		FSlateIcon(FEditorStyle::GetStyleSetName(), "SourceControl.Actions.Sync"),
+#endif
 		FUIAction(
 			FExecuteAction::CreateRaw(this, &FGitSourceControlMenu::SyncClicked),
 			FCanExecuteAction::CreateRaw(this, &FGitSourceControlMenu::HaveRemoteUrl)
@@ -479,9 +595,16 @@ void FGitSourceControlMenu::AddMenuExtension(FMenuBuilder& Builder)
 	);
 
 	Builder.AddMenuEntry(
+#if ENGINE_MAJOR_VERSION == 5
+		"GitRevert",
+#endif
 		LOCTEXT("GitRevert",			"Revert"),
 		LOCTEXT("GitRevertTooltip",		"Revert all files in the repository to their unchanged state."),
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+		FSlateIcon(FAppStyle::GetAppStyleSetName(), "SourceControl.Actions.Revert"),
+#else
 		FSlateIcon(FEditorStyle::GetStyleSetName(), "SourceControl.Actions.Revert"),
+#endif
 		FUIAction(
 			FExecuteAction::CreateRaw(this, &FGitSourceControlMenu::RevertClicked),
 			FCanExecuteAction()
@@ -489,9 +612,16 @@ void FGitSourceControlMenu::AddMenuExtension(FMenuBuilder& Builder)
 	);
 
 	Builder.AddMenuEntry(
+#if ENGINE_MAJOR_VERSION == 5
+		"GitRefresh",
+#endif
 		LOCTEXT("GitRefresh",			"Refresh"),
 		LOCTEXT("GitRefreshTooltip",	"Update the source control status of all files in the local repository."),
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+		FSlateIcon(FAppStyle::GetAppStyleSetName(), "SourceControl.Actions.Refresh"),
+#else
 		FSlateIcon(FEditorStyle::GetStyleSetName(), "SourceControl.Actions.Refresh"),
+#endif
 		FUIAction(
 			FExecuteAction::CreateRaw(this, &FGitSourceControlMenu::RefreshClicked),
 			FCanExecuteAction()
@@ -499,6 +629,7 @@ void FGitSourceControlMenu::AddMenuExtension(FMenuBuilder& Builder)
 	);
 }
 
+#if ENGINE_MAJOR_VERSION == 4
 TSharedRef<FExtender> FGitSourceControlMenu::OnExtendLevelEditorViewMenu(const TSharedRef<FUICommandList> CommandList)
 {
 	TSharedRef<FExtender> Extender(new FExtender());
@@ -511,5 +642,6 @@ TSharedRef<FExtender> FGitSourceControlMenu::OnExtendLevelEditorViewMenu(const T
 
 	return Extender;
 }
+#endif
 
 #undef LOCTEXT_NAMESPACE
